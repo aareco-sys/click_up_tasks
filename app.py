@@ -6,6 +6,9 @@ import plotly.express as px
 import streamlit as st
 
 REPORT_PATH = "clickup_tasks_report.xlsx"
+FRESHDESK_PATH = "freshdesk_tickets_report.xlsx"
+
+FD_OPEN_STATUSES = {"Open", "Pending", "Waiting on Customer", "Waiting on Third Party"}
 
 st.set_page_config(
     page_title="ClickUp Dashboard",
@@ -46,6 +49,31 @@ def load_data(path: str, mtime: float) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner=False)
+def load_freshdesk(path: str, mtime: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    tickets = pd.read_excel(path, sheet_name="tickets")
+    entries = pd.read_excel(path, sheet_name="time_entries")
+
+    for col in ("created_at", "updated_at", "resolved_at", "closed_at", "first_responded_at"):
+        if col in tickets.columns:
+            tickets[col] = pd.to_datetime(tickets[col], errors="coerce")
+    if "time_tracked_hours" in tickets.columns:
+        tickets["time_tracked_hours"] = pd.to_numeric(
+            tickets["time_tracked_hours"], errors="coerce"
+        ).fillna(0.0)
+    for col in ("agent", "group", "company", "agent_email"):
+        if col in tickets.columns:
+            tickets[col] = tickets[col].fillna("").replace("", "Sin asignar" if col == "agent" else "")
+
+    for col in ("executed_at", "created_at", "updated_at"):
+        if col in entries.columns:
+            entries[col] = pd.to_datetime(entries[col], errors="coerce")
+    if "hours" in entries.columns:
+        entries["hours"] = pd.to_numeric(entries["hours"], errors="coerce").fillna(0.0)
+
+    return tickets, entries
+
+
 def explode_assignees(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["assignee"] = out["assignees"].str.split(", ")
@@ -62,6 +90,11 @@ if not os.path.exists(REPORT_PATH):
     st.stop()
 
 df = load_data(REPORT_PATH, os.path.getmtime(REPORT_PATH))
+
+fd_tickets: pd.DataFrame | None = None
+fd_entries: pd.DataFrame | None = None
+if os.path.exists(FRESHDESK_PATH):
+    fd_tickets, fd_entries = load_freshdesk(FRESHDESK_PATH, os.path.getmtime(FRESHDESK_PATH))
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 st.sidebar.header("Filtros")
@@ -171,16 +204,21 @@ c5.metric("Promedio h/tarea", f"{avg_hours:,.2f}")
 st.divider()
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-tab_overview, tab_people, tab_status, tab_struct, tab_list, tab_table = st.tabs(
-    [
-        "🏠 Resumen",
-        "👥 Por persona",
-        "📌 Por status",
-        "🗂️ Por folder/lista",
-        "📁 Por lista",
-        "📋 Detalle",
-    ]
-)
+tab_labels = [
+    "🏠 Resumen",
+    "👥 Por persona",
+    "📌 Por status",
+    "🗂️ Por folder/lista",
+    "📁 Por lista",
+    "📋 Detalle",
+]
+if fd_tickets is not None:
+    tab_labels.extend(["🎫 Freshdesk", "🔗 Unificado"])
+
+tabs = st.tabs(tab_labels)
+tab_overview, tab_people, tab_status, tab_struct, tab_list, tab_table = tabs[:6]
+tab_freshdesk = tabs[6] if fd_tickets is not None else None
+tab_unified = tabs[7] if fd_tickets is not None else None
 
 with tab_overview:
     if filtered.empty:
@@ -622,3 +660,300 @@ with tab_table:
         file_name="clickup_filtered.csv",
         mime="text/csv",
     )
+
+
+if tab_freshdesk is not None:
+    with tab_freshdesk:
+        fd = fd_tickets.copy()
+        fd["is_open"] = fd["status"].isin(FD_OPEN_STATUSES)
+        today = pd.Timestamp(datetime.now().date())
+        end_ref = fd["resolved_at"].fillna(fd["closed_at"]).fillna(today)
+        fd["dias_abierta"] = (end_ref - fd["created_at"]).dt.days
+
+        st.subheader("KPIs")
+        total = len(fd)
+        opened = int(fd["is_open"].sum())
+        resolved = int(fd["resolved_at"].notna().sum())
+        escalated = int(fd["is_escalated"].sum())
+        total_h = float(fd["time_tracked_hours"].sum())
+        avg_h = total_h / total if total else 0.0
+
+        last_30 = today - pd.Timedelta(days=30)
+        created_30 = int((fd["created_at"] >= last_30).sum())
+        resolved_30 = int((fd["resolved_at"] >= last_30).sum())
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Tickets totales", f"{total:,}")
+        k2.metric("Abiertos", f"{opened:,}")
+        k3.metric("Resueltos", f"{resolved:,}")
+        k4.metric("Escalados", f"{escalated:,}")
+
+        k5, k6, k7, k8 = st.columns(4)
+        k5.metric("Horas trackeadas", f"{total_h:,.1f}")
+        k6.metric("Prom. h/ticket", f"{avg_h:,.2f}")
+        k7.metric("Creados (30d)", f"{created_30:,}")
+        k8.metric("Resueltos (30d)", f"{resolved_30:,}")
+
+        st.divider()
+        st.subheader("Distribución")
+        g1, g2 = st.columns(2)
+        with g1:
+            by_status = fd.groupby("status").size().reset_index(name="tickets")
+            fig = px.pie(by_status, names="status", values="tickets", title="Tickets por status", hole=0.5)
+            fig.update_layout(height=380)
+            st.plotly_chart(fig, use_container_width=True)
+        with g2:
+            by_pri = fd.groupby("priority").size().reset_index(name="tickets")
+            fig = px.bar(
+                by_pri,
+                x="priority",
+                y="tickets",
+                text="tickets",
+                title="Tickets por prioridad",
+                color="priority",
+                color_discrete_map={"Low": "#22c55e", "Medium": "#eab308", "High": "#f97316", "Urgent": "#ef4444"},
+            )
+            fig.update_traces(textposition="outside")
+            fig.update_layout(height=380, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+        g3, g4 = st.columns(2)
+        with g3:
+            by_source = fd.groupby("source").size().reset_index(name="tickets").sort_values("tickets", ascending=False)
+            fig = px.bar(by_source, x="source", y="tickets", text="tickets", title="Tickets por canal")
+            fig.update_traces(textposition="outside")
+            fig.update_layout(height=380, xaxis_tickangle=-30)
+            st.plotly_chart(fig, use_container_width=True)
+        with g4:
+            top_groups = (
+                fd.groupby("group").size().sort_values(ascending=False).head(10).reset_index(name="tickets")
+            )
+            fig = px.bar(
+                top_groups,
+                x="tickets",
+                y="group",
+                text="tickets",
+                orientation="h",
+                title="Top grupos",
+            )
+            fig.update_traces(textposition="outside")
+            fig.update_layout(height=380, yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        st.subheader("Agentes")
+        per_agent = (
+            fd.groupby("agent")
+            .agg(
+                tickets=("ticket_id", "count"),
+                horas=("time_tracked_hours", "sum"),
+                resueltos=("resolved_at", lambda s: int(s.notna().sum())),
+            )
+            .reset_index()
+            .sort_values("tickets", ascending=False)
+        )
+        per_agent["horas"] = per_agent["horas"].round(2)
+        per_agent["prom_h_ticket"] = (per_agent["horas"] / per_agent["tickets"]).round(2).fillna(0)
+
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            fig = px.bar(
+                per_agent.head(15),
+                x="agent",
+                y="tickets",
+                text="tickets",
+                title="Tickets por agente (top 15)",
+            )
+            fig.update_traces(textposition="outside")
+            fig.update_layout(height=420, xaxis_tickangle=-30)
+            st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            st.dataframe(per_agent, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("Tendencia y aging")
+        g5, g6 = st.columns(2)
+        with g5:
+            monthly = pd.DataFrame(
+                {
+                    "Creados": fd.groupby(fd["created_at"].dt.to_period("M")).size(),
+                    "Resueltos": fd[fd["resolved_at"].notna()]
+                    .groupby(fd[fd["resolved_at"].notna()]["resolved_at"].dt.to_period("M"))
+                    .size(),
+                }
+            ).fillna(0).astype(int)
+            monthly.index = monthly.index.astype(str)
+            monthly = monthly.reset_index().rename(columns={"index": "mes"}).melt(
+                id_vars="mes", var_name="tipo", value_name="tickets"
+            )
+            fig = px.line(monthly, x="mes", y="tickets", color="tipo", markers=True, title="Creados vs resueltos por mes")
+            fig.update_layout(height=380)
+            st.plotly_chart(fig, use_container_width=True)
+        with g6:
+            open_fd = fd[fd["is_open"]].copy()
+            if not open_fd.empty:
+                bins = [-1, 7, 30, 90, float("inf")]
+                labels_ag = ["0-7 días", "7-30 días", "30-90 días", "+90 días"]
+                open_fd["bucket"] = pd.cut(open_fd["dias_abierta"], bins=bins, labels=labels_ag)
+                aging = (
+                    open_fd.groupby("bucket", observed=True)
+                    .size()
+                    .reindex(labels_ag, fill_value=0)
+                    .reset_index(name="tickets")
+                )
+                fig = px.bar(
+                    aging,
+                    x="bucket",
+                    y="tickets",
+                    text="tickets",
+                    title="Aging de tickets abiertos",
+                    color="bucket",
+                    color_discrete_sequence=["#22c55e", "#eab308", "#f97316", "#ef4444"],
+                )
+                fig.update_traces(textposition="outside")
+                fig.update_layout(height=380, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No hay tickets abiertos.")
+
+        st.divider()
+        st.subheader("Detalle")
+        st.dataframe(
+            fd.sort_values("created_at", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+if tab_unified is not None:
+    with tab_unified:
+        st.subheader("Resumen unificado ClickUp + Freshdesk")
+
+        cu_tasks = len(df)
+        cu_hours = float(df["time_tracked_hours"].sum())
+        fd_count = len(fd_tickets)
+        fd_hours = float(fd_tickets["time_tracked_hours"].sum())
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Tareas ClickUp", f"{cu_tasks:,}")
+        k2.metric("Tickets Freshdesk", f"{fd_count:,}")
+        k3.metric("Horas ClickUp", f"{cu_hours:,.1f}")
+        k4.metric("Horas Freshdesk", f"{fd_hours:,.1f}")
+
+        k5, k6 = st.columns(2)
+        k5.metric("Trabajo total (items)", f"{cu_tasks + fd_count:,}")
+        k6.metric("Horas combinadas", f"{cu_hours + fd_hours:,.1f}")
+
+        st.divider()
+        st.subheader("Carga por persona (join por email)")
+
+        cu = df.copy()
+        cu["assignee_emails"] = cu["assignee_emails"].fillna("")
+        cu_long = cu.assign(email=cu["assignee_emails"].str.split(", ")).explode("email")
+        cu_long["email"] = cu_long["email"].fillna("").str.strip().str.lower()
+        cu_per_person = (
+            cu_long[cu_long["email"] != ""]
+            .groupby("email")
+            .agg(
+                clickup_tareas=("task_id", "count"),
+                clickup_horas=("time_tracked_hours", "sum"),
+            )
+            .reset_index()
+        )
+
+        fd_p = fd_tickets.copy()
+        fd_p["agent_email"] = fd_p["agent_email"].fillna("").str.strip().str.lower()
+        fd_per_person = (
+            fd_p[fd_p["agent_email"] != ""]
+            .groupby("agent_email")
+            .agg(
+                freshdesk_tickets=("ticket_id", "count"),
+                freshdesk_horas=("time_tracked_hours", "sum"),
+            )
+            .reset_index()
+            .rename(columns={"agent_email": "email"})
+        )
+
+        unified = pd.merge(cu_per_person, fd_per_person, on="email", how="outer").fillna(0)
+        for c in ("clickup_tareas", "freshdesk_tickets"):
+            unified[c] = unified[c].astype(int)
+        unified["horas_total"] = (unified["clickup_horas"] + unified["freshdesk_horas"]).round(2)
+        unified["clickup_horas"] = unified["clickup_horas"].round(2)
+        unified["freshdesk_horas"] = unified["freshdesk_horas"].round(2)
+        unified["items_total"] = unified["clickup_tareas"] + unified["freshdesk_tickets"]
+        unified = unified.sort_values("horas_total", ascending=False)
+
+        col_a, col_b = st.columns([3, 2])
+        with col_a:
+            top = unified.head(15).melt(
+                id_vars="email",
+                value_vars=["clickup_horas", "freshdesk_horas"],
+                var_name="origen",
+                value_name="horas",
+            )
+            top["origen"] = top["origen"].map(
+                {"clickup_horas": "ClickUp", "freshdesk_horas": "Freshdesk"}
+            )
+            fig = px.bar(
+                top,
+                x="email",
+                y="horas",
+                color="origen",
+                title="Horas por persona (top 15) — apiladas",
+                barmode="stack",
+                color_discrete_map={"ClickUp": "#6366f1", "Freshdesk": "#10b981"},
+            )
+            fig.update_layout(height=440, xaxis_tickangle=-30)
+            st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            top_items = unified.head(15).melt(
+                id_vars="email",
+                value_vars=["clickup_tareas", "freshdesk_tickets"],
+                var_name="origen",
+                value_name="items",
+            )
+            top_items["origen"] = top_items["origen"].map(
+                {"clickup_tareas": "ClickUp", "freshdesk_tickets": "Freshdesk"}
+            )
+            fig = px.bar(
+                top_items,
+                x="email",
+                y="items",
+                color="origen",
+                title="Items por persona (top 15) — apilados",
+                barmode="stack",
+                color_discrete_map={"ClickUp": "#6366f1", "Freshdesk": "#10b981"},
+            )
+            fig.update_layout(height=440, xaxis_tickangle=-30)
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(unified, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("Actividad mensual combinada")
+
+        cu_monthly = (
+            df.groupby(df["date_created"].dt.to_period("M"))
+            .size()
+            .rename("ClickUp creadas")
+        )
+        fd_monthly = (
+            fd_tickets.groupby(fd_tickets["created_at"].dt.to_period("M"))
+            .size()
+            .rename("Freshdesk creados")
+        )
+        combined = pd.concat([cu_monthly, fd_monthly], axis=1).fillna(0).astype(int)
+        combined.index = combined.index.astype(str)
+        combined = combined.reset_index().rename(columns={"index": "mes"})
+        combined_long = combined.melt(id_vars="mes", var_name="origen", value_name="items")
+
+        fig = px.line(
+            combined_long,
+            x="mes",
+            y="items",
+            color="origen",
+            markers=True,
+            title="Items creados por mes — ambos sistemas",
+        )
+        fig.update_layout(height=420)
+        st.plotly_chart(fig, use_container_width=True)

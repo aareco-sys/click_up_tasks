@@ -1,0 +1,23 @@
+# Reportes generados (datos reales del workspace)
+*.xlsx
+*.csv
+
+# Secretos / entorno
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / herramientas locales
+.vscode/
+.idea/
+.claude/

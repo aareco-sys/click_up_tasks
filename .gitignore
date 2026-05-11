@@ -21,3 +21,7 @@ env/
 .vscode/
 .idea/
 .claude/
+update.log
+launchd.out.log
+launchd.err.log
+streamlit.log
